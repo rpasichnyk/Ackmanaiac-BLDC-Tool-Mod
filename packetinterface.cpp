@@ -1,5 +1,5 @@
 /*
-    Copyright 2012-2016 Benjamin Vedder	benjamin@vedder.se
+    Copyright 2012-2016 Benjamin Vedder benjamin@vedder.se
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -18,6 +18,7 @@
 #include "packetinterface.h"
 #include "utility.h"
 #include <QDebug>
+#include <QHostAddress>
 #include <math.h>
 
 namespace {
@@ -83,13 +84,18 @@ PacketInterface::PacketInterface(QObject *parent) :
     mTimer->setInterval(10);
     mTimer->start();
 
-    mHostAddress = QHostAddress("0.0.0.0");
-    mUdpPort = 0;
-    mUdpSocket = new QUdpSocket(this);
-
-    connect(mUdpSocket, SIGNAL(readyRead()),
-            this, SLOT(readPendingDatagrams()));
     connect(mTimer, SIGNAL(timeout()), this, SLOT(timerSlot()));
+    mTcpSocket = new QTcpSocket(this);
+    mTcpConnected = false;
+    mLastTcpServer = "";
+    mLastTcpPort = 0;
+
+    connect(mTcpSocket, SIGNAL(readyRead()), this, SLOT(tcpInputDataAvailable()));
+    connect(mTcpSocket, SIGNAL(connected()), this, SLOT(tcpInputConnected()));
+    connect(mTcpSocket, SIGNAL(disconnected()),
+            this, SLOT(tcpInputDisconnected()));
+    connect(mTcpSocket, SIGNAL(error(QAbstractSocket::SocketError)),
+            this, SLOT(tcpInputError(QAbstractSocket::SocketError)));
 }
 
 PacketInterface::~PacketInterface()
@@ -204,21 +210,6 @@ void PacketInterface::timerSlot()
     }
 }
 
-void PacketInterface::readPendingDatagrams()
-{
-    while (mUdpSocket->hasPendingDatagrams()) {
-        QByteArray datagram;
-        datagram.resize(mUdpSocket->pendingDatagramSize());
-        QHostAddress sender;
-        quint16 senderPort;
-
-        mUdpSocket->readDatagram(datagram.data(), datagram.size(),
-                                &sender, &senderPort);
-                                
-        processData(datagram);
-    }
-}
-
 unsigned short PacketInterface::crc16(const unsigned char *buf, unsigned int len)
 {
     unsigned int i;
@@ -273,13 +264,11 @@ bool PacketInterface::sendPacket(const unsigned char *data, unsigned int len_pac
 
     QByteArray sendData = QByteArray::fromRawData((char*)buffer, ind);
 
-    if (QString::compare(mHostAddress.toString(), "0.0.0.0") != 0) {
-
-        mUdpSocket->writeDatagram(sendData, mHostAddress, mUdpPort);
-        return true;
+    if (mTcpConnected && mTcpSocket->isOpen()) {
+        mTcpSocket->write(sendData);
+    } else {
+        emit dataToSend(sendData);
     }
-
-    emit dataToSend(sendData);
 
     return true;
 }
@@ -346,6 +335,7 @@ void PacketInterface::processPacket(const unsigned char *data, int len)
         values.current_in = utility::buffer_get_double32(data, 100.0, &ind);
         values.duty_now = utility::buffer_get_double16(data, 1000.0, &ind);
         values.rpm = utility::buffer_get_double32(data, 1.0, &ind);
+        // bastardo!
         values.v_in = utility::buffer_get_double16(data, 100.0, &ind);
         values.amp_hours = utility::buffer_get_double32(data, 10000.0, &ind);
         values.amp_hours_charged = utility::buffer_get_double32(data, 10000.0, &ind);
@@ -552,8 +542,8 @@ void PacketInterface::processPacket(const unsigned char *data, int len)
         memcpy(appconf.app_nrf_conf.address, data + ind, 3);
         ind += 3;
         appconf.app_nrf_conf.send_crc_ack = data[ind++];
-		
-		// new config
+        
+        // new config
         appconf.app_ppm_conf.pulse_center = utility::buffer_get_double32(data, 1000.0, &ind);
         appconf.app_ppm_conf.tc_offset = utility::buffer_get_double32(data, 1000.0, &ind);
         appconf.app_ppm_conf.cruise_left = (ppm_cruise)data[ind++];
@@ -579,11 +569,11 @@ void PacketInterface::processPacket(const unsigned char *data, int len)
         appconf.app_throttle_conf.x2_neg_throttle = utility::buffer_get_double16(data, 1000.0, &ind);
         appconf.app_throttle_conf.x3_neg_throttle = utility::buffer_get_double16(data, 1000.0, &ind);
         appconf.app_throttle_conf.bezier_neg_reduce_factor = utility::buffer_get_double16(data, 100.0, &ind);
-        	
+            
         
 
-		// new config end
-		
+        // new config end
+        
         emit appconfReceived(appconf);
         break;
 
@@ -1261,24 +1251,55 @@ void PacketInterface::setSendCan(bool sendCan, unsigned int id)
     mCanId = id;
 }
 
-void PacketInterface::startUdpConnection(QHostAddress ip, int port)
+void PacketInterface::startTcpConnection(QString ip, int port)
 {
-    mHostAddress = ip;
-    mUdpPort = port;
-    mUdpSocket->close();
-    mUdpSocket->bind(QHostAddress::Any, mUdpPort + 1);
+    mLastTcpServer = ip;
+    mLastTcpPort = port;
+
+    QHostAddress host;
+    host.setAddress(ip);
+
+    mTcpSocket->abort();
+    mTcpSocket->connectToHost(host, port);
 }
 
-void PacketInterface::stopUdpConnection()
+void PacketInterface::stopTcpConnection()
 {
-    mHostAddress = QHostAddress("0.0.0.0");
-    mUdpPort = 0;
-    mUdpSocket->close();
+    if (mTcpConnected) {
+        mTcpSocket->close();
+    }
 }
 
-bool PacketInterface::isUdpConnected()
+bool PacketInterface::isTcpConnected()
 {
-    return QString::compare(mHostAddress.toString(), "0.0.0.0") != 0;
+    return mTcpConnected;
+}
+
+
+void PacketInterface::tcpInputConnected()
+{
+    mTcpConnected = true;
+}
+
+void PacketInterface::tcpInputDisconnected()
+{
+    mTcpConnected = false;
+}
+
+void PacketInterface::tcpInputDataAvailable()
+{
+    while (mTcpSocket->bytesAvailable() > 0) {
+        auto data = mTcpSocket->readAll();
+        processData(data);
+    }
+}
+
+void PacketInterface::tcpInputError(QAbstractSocket::SocketError socketError)
+{
+    (void)socketError;
+
+    QString errorStr = mTcpSocket->errorString();
+    mTcpSocket->close();
 }
 
 bool PacketInterface::sendCustomAppData(QByteArray data)
